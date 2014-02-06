@@ -10,7 +10,7 @@
 #if (cuda)
 	#include <cuda.h>
 	#include <cuda_runtime.h>
-/*	
+/*
 	#if CUDA_VERSION==5000
         	#include <helper_cuda.h>
 	#else
@@ -27,7 +27,7 @@
 	#define tid  (tx + blockDim.x*( ty + blockDim.y  *( bx + gridDim.x*by)))
 /*
 	From "gprism_inference_cudakernel_BUFFER.cu":
-	unsigned long int location = (gridDim.x*blockIdx.y + blockIdx.x) * 
+	unsigned long int location = (gridDim.x*blockIdx.y + blockIdx.x) *
         (blockDim.x*blockDim.y) + (blockDim.x*threadIdx.y + threadIdx.x);
 */
 #endif
@@ -88,7 +88,7 @@ __global__ void changemat(uint32_T *chMat, uint32_T chMat_dim, uint32_T ntiles)
     chMat_dim:  dimX * dimY of cross matrix;
     ntiles:     to be splitted between blocks of threads and grid;
  OUTPUTS:
-    chMat:      change matrix sum considering all tiles --> only the first 
+    chMat:      change matrix sum considering all tiles --> only the first
                 tile/layer is the output (i.e. chMat(:,:,1) );
 */
 	uint32_T k,j,i,ii,nt,isodd;
@@ -104,7 +104,7 @@ __global__ void changemat(uint32_T *chMat, uint32_T chMat_dim, uint32_T ntiles)
             operation i<<1      ---> binary 110     ---> decimal ii=6
     */
     ii      = i<<1;
-    /*  if nt is odd then ii is not equal to nt (e.g. nt=7,ii=6), otherwise 
+    /*  if nt is odd then ii is not equal to nt (e.g. nt=7,ii=6), otherwise
         it does (e.g. nt=6, ii=6).
     */
     isodd   = (ii!=nt);
@@ -116,14 +116,14 @@ __global__ void changemat(uint32_T *chMat, uint32_T chMat_dim, uint32_T ntiles)
 			for(j=0;j<chMat_dim;j++) {
                 /*  It sums - in k tile - k tile with the k+ntiles/2
                     ( remember that ntiles/2 is expressed by i (after i>>1) )
-                    At the end of while loop the change signatures from all 
+                    At the end of while loop the change signatures from all
                     pixels of the iMap1 & iMap2 are summed in the first tile.
                 */
                 		chMat[k+j]=chMat[k+j]+chMat[k+j+i*chMat_dim];
                 /*
-                    If the number of tiles at current while loop is odd, 
+                    If the number of tiles at current while loop is odd,
                     then the first thread has to add to its k tile (i.e. the
-                    first tile) the tile excluded from summation by the 
+                    first tile) the tile excluded from summation by the
                     previous line of code.
                 */
                 		if ((tid==0)&&(isodd)) {
@@ -135,7 +135,7 @@ __global__ void changemat(uint32_T *chMat, uint32_T chMat_dim, uint32_T ntiles)
 
         /*  It steps forward to the next while loop only when all threads
             have finished:
-        */		
+        */
         __syncthreads();
         /* Wait all writes in global memory*/
         //__threadfence();
