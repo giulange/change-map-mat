@@ -4,16 +4,13 @@
 
 # Add inputs and outputs from these tool invocations to the build variables 
 CU_SRCS += \
-../src/changemapmat.cu \
-../src/template.cu 
+../src/changemapmat.cu 
 
 CU_DEPS += \
-./src/changemapmat.d \
-./src/template.d 
+./src/changemapmat.d 
 
 OBJS += \
-./src/changemapmat.o \
-./src/template.o 
+./src/changemapmat.o 
 
 
 # Each subdirectory must supply rules for building sources it contributes

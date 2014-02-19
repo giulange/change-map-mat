@@ -1,0 +1,9 @@
+#Staged concurrent copy and execute:
+
+size=N*sizeof(float)/nStreams;
+for (i=0; i<nStreams; i++) {
+    offset = i*N/nStreams;
+    cudaMemcpyAsync(a_d+offset, a_h+offset, size, dir, stream[i]);
+    kernel<<<N/(nThreads*nStreams), nThreads, 0,  
+             stream[i]>>>(a_d+offset);
+}

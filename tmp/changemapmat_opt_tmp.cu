@@ -23,7 +23,6 @@
 #define by blockIdx.y
 #define tid  (tx + blockDim.x*( ty + blockDim.y  *( bx + gridDim.x*by)))
 
-#define KRED  "\x1B[31m"
 //#define uintXX_t uint32_T
 
 /*
@@ -37,11 +36,11 @@
     chMat:      change matrix 	---> storing the accountancy of classes change-of-state;
     oMap:       change map 		---> storing the differences between iMap1 and iMap2 (code:2211);
 */
-__global__ void changemap( const uint8_T *iMap1,const uint8_T *iMap2,const uint8_T *roiMap,
+__global__ void changemap( const uint8_T *iMap1,const uint8_T *iMap2,
                            uint32_T nX, uint32_T nY, uint32_T pitch, uint32_T nclasses,
                            uint32_T *chMat, uint32_T *oMap )
 {
-	uint32_T iCl1,iCl2,iroi,i_row,x,k;
+	uint32_T iCl1,iCl2,i_row,x,k;
 	if (tid<nY){
         /* i: offset to move the pointer tile-by-tile on the input/output maps
               (iMap1,iMap2,oMap): this is helpful to assign each tile to a thread.
@@ -57,14 +56,61 @@ __global__ void changemap( const uint8_T *iMap1,const uint8_T *iMap2,const uint8
         */
 		// The pointer along the x direction is straightforward:
 		for( x=0; x<nX; x++ ){
-			iCl1 			= iMap1 [i_row+x];
-			iCl2 			= iMap2 [i_row+x];
-			iroi 			= roiMap[i_row+x]; // 0:out-of-roi; 1:in-roi
-			oMap[i_row+x] 	= ( iCl1 + iCl2*100 )*iroi;
-			chMat[ (k + (iCl1+iCl2*nclasses))*iroi ]++;
+			iCl1 			= iMap1[i_row+x];
+			iCl2 			= iMap2[i_row+x];
+			oMap[i_row+x] 	= ( iCl1 + iCl2*100 );
+			chMat[ k + (iCl1+iCl2*nclasses) ]++;
 		}
 	}
 }
+
+
+__global__ void changemap_shmem( 	const uint8_T *iMap1,const uint8_T *iMap2,
+                           	   	   uint32_T nX, uint32_T nY, uint32_T pitch, uint32_T nclasses,
+                           	   	   uint32_T *chMat, uint32_T *oMap )
+{
+	__shared__ uint8_T s_iMap1[1024];
+	__shared__ uint8_T s_iMap2[1024];
+	__shared__ uint8_T s_oMap_[1024];
+	__shared__ uint8_T s_chMat[36];
+
+	uint32_T iCl1,iCl2,i_row,x,k;
+
+	// Tile ID: (of size 1024x1)
+	uint32_T Tid =  tx;
+	// Map ID:
+	uint32_T Mid = (tx + blockDim.x*( ty + blockDim.y  *( bx + gridDim.x*by)));
+	// iTile within GRID:
+	uint32_T Gid =  bx + gridDim.x*by;
+
+	if( Gid<(gridDim.x*gridDim.y) ) {
+
+		s_iMap1[Tid] = iMap1[Mid]; syncthreads();
+		s_iMap2[Tid] = iMap2[Mid]; syncthreads();
+		s_oMap_[Tid] = oMap [Mid]; syncthreads();
+
+		/* i: offset to move the pointer tile-by-tile on the input/output maps
+              (iMap1,iMap2,oMap): this is helpful to assign each tile to a thread.
+        */
+		i_row = tid * pitch;// ***pitch!!
+        /* k: offset to move the pointer tile-by-tile on the output change
+              matrix (chMat):
+        */
+		k = tid*nclasses*nclasses;
+        /*  Now that "i" is defined (that is the pointer to the first element
+            of any row==tile), I have to offset along the y direction (see the
+            for loop on x below).
+        */
+		// The pointer along the x direction is straightforward:
+		for( x=0; x<nX; x++ ){
+			iCl1 			= iMap1[i_row+x];
+			iCl2 			= iMap2[i_row+x];
+			oMap[i_row+x] 	= ( iCl1 + iCl2*100 );
+			chMat[ k + (iCl1+iCl2*nclasses) ]++;
+		}
+	}
+}
+
 
 __global__ void changemat(uint32_T *chMat, uint32_T classes_2, uint32_T ntiles)
 {
@@ -168,26 +214,21 @@ int main(int argc, char **argv)
 		dataset.BuildOverviews(overviewlist);
 	*/
 
-	GDALDatasetH		iMap1,iMap2, oMap, roiMap;
-	GDALRasterBandH		iBand1,iBand2, oBand, roiBand;
+	GDALDatasetH		iMap1,iMap2, oMap;
+	GDALRasterBandH		iBand1,iBand2, oBand;
 	GDALDriverH			hDriver;
 	uint8_T				*dev_iMap1, *dev_iMap2;
 	uint32_T			*dev_oMap, *dev_chMat;
-	uint8_T				*dev_roiMap;
-/*	uint8_T  			*host_iMap1, *host_iMap2;
+	uint8_T  			*host_iMap1, *host_iMap2;
 	uint32_T 			*host_oMap, *host_chMat;
-*/	uint32_T 			nclasses;//tiledimX, tiledimY, ntilesX, ntilesY;
+	uint32_T 			nclasses;//tiledimX, tiledimY, ntilesX, ntilesY;
 //	unsigned int		deltaX=0,deltaY=0;
-	// cuda timer:
-	float 				elapsed_time_ms = 0.0f;
-	cudaEvent_t 		start, stop;
 	// size of iMap's: [nX * nY]
 	unsigned int 		nX, nY;
 	// block & grid kernel size:
 	unsigned int 		BLOCKSIZE, GRIDSIZE;
 	// GPU device
 	int					devCount;
-	int					gpuSel=0;
 	cudaDeviceProp		devProp;
 //	size_t				iPitch1, iPitch2, oPitch;
 	// options for GDALCreate:
@@ -197,32 +238,19 @@ int main(int argc, char **argv)
 
 	GDALAllRegister();	// Establish GDAL context.
 	cudaFree(0); 		// Establish CUDA context.
-	cudaEventCreate( &start );
-	cudaEventCreate( &stop );
 
 	// SET VARIABLES (I should pass it to the main function as input)
 	nclasses	= 5 +1;
 
 	// filename of maps:
-	//	I/-
-	//	**ITALY**
-	const char *iFil1	= "/home/giuliano/work/Projects/LIFE_Project/LUC_gpgpu/rasterize/clc2000_L1_100m";
-	const char *iFil2	= "/home/giuliano/work/Projects/LIFE_Project/LUC_gpgpu/rasterize/clc2006_L1_100m";
-	const char *roiFil	= "/home/giuliano/work/Projects/LIFE_Project/LUC_gpgpu/rasterize/clc_roi_100m";
-	//	**EUROPE**
-/*	const char *iFil1	= "/home/giuliano/Downloads/GISDATA/CLC/2000_g100/g100_00.tif";
-	const char *iFil2	= "/home/giuliano/Downloads/GISDATA/CLC/2006_g100/g100_06.tif";
-	const char *roiFil	= "/home/giuliano/work/Projects/LIFE_Project/LUC_gpgpu/rasterize/clc_roi_EUR_100m";
-*/	//	-/O
-	const char *oFil	= "/home/giuliano/work/Projects/LIFE_Project/LUC_gpgpu/rasterize/ch00-06_L1_100m";
-	//	**chMat**
-	//	-/O
-	const char *chFil	= "/home/giuliano/work/Projects/LIFE_Project/LUC_gpgpu/rasterize/chMat.txt";
+	const char *iFil1 = "/home/giuliano/work/Projects/LIFE_Project/LUC_gpgpu/rasterize/clc2000_L1_100m";
+	const char *iFil2 = "/home/giuliano/work/Projects/LIFE_Project/LUC_gpgpu/rasterize/clc2006_L1_100m";
+	const char *oFil  = "/home/giuliano/work/Projects/LIFE_Project/LUC_gpgpu/rasterize/ch00-06_L1_100m";
+	const char *chFil = "/home/giuliano/work/Projects/LIFE_Project/LUC_gpgpu/rasterize/chMat.txt";
 
 	// open iMap's
-	iMap1 				= GDALOpen( iFil1, GA_ReadOnly );
-	iMap2 				= GDALOpen( iFil2, GA_ReadOnly );
-	roiMap 				= GDALOpen( roiFil, GA_ReadOnly );
+	iMap1 = GDALOpen( iFil1, GA_ReadOnly );
+	iMap2 = GDALOpen( iFil2, GA_ReadOnly );
 	if( iMap1 == NULL || iMap2 == NULL ){ printf("Error: cannot load input grids!\n"); return 1;}
 	// driver of iMap's
 	hDriver = GDALGetDatasetDriver( iMap1 );
@@ -230,79 +258,63 @@ int main(int argc, char **argv)
 	// Spatial Reference System:
 	if( GDALGetProjectionRef( iMap1 ) == NULL || GDALGetProjectionRef( iMap2 ) == NULL ){
 		printf("Error: one or more input layers miss spatial reference system!");
-		exit(EXIT_FAILURE);
+		return 1;
 	}
-	printf( "Projection is:\t\t\t%s\n", GDALGetProjectionRef( iMap1 ) );
+	printf( "Projection is:\n\n `%s'\n\n", GDALGetProjectionRef( iMap1 ) );
 	GDALGetGeoTransform( iMap1, iGeoTransform );
 
 	// get size
 	nX = GDALGetRasterXSize( iMap1 );
 	nY = GDALGetRasterYSize( iMap1 );
-	if( nX!=GDALGetRasterXSize( iMap2  ) || nY!=GDALGetRasterYSize( iMap2  ) ||
-		nX!=GDALGetRasterXSize( roiMap ) || nY!=GDALGetRasterYSize( roiMap ) ){
+	if( nX!=GDALGetRasterXSize( iMap2 ) || nY!=GDALGetRasterYSize( iMap2 ) ){
 		printf("Error: the input iMaps have different SIZE!\n");
-		exit(EXIT_FAILURE);
+		return 1;// 1 ==> error
 	}
-	printf("Size of iMaps:\t\t\t%dx%d\t[el]\n",nX,nY);
 	if(GDALGetRasterCount( iMap1 )>1 || GDALGetRasterCount( iMap1 )!=GDALGetRasterCount( iMap2 )){
 		printf("Error: iMaps have more than 1 band! [not allowed]");
-		exit(EXIT_FAILURE);
+		return 1;
 	}
-	iBand1				= GDALGetRasterBand( iMap1,  GDALGetRasterCount( iMap1  ) ); // GDALGetRasterCount( iMap1 ) is equal to 1.
-	iBand2				= GDALGetRasterBand( iMap2,  GDALGetRasterCount( iMap2  ) );
-	roiBand				= GDALGetRasterBand( roiMap, GDALGetRasterCount( roiMap ) );
+	iBand1 = GDALGetRasterBand( iMap1, GDALGetRasterCount( iMap1 ) ); // GDALGetRasterCount( iMap1 ) is equal to 1.
+	iBand2 = GDALGetRasterBand( iMap2, GDALGetRasterCount( iMap2 ) );
 
 	// allocate on RAM
 //	uint32_T			iWIDTH_bytes= 	 nX*sizeof(uint8_T  );
 //	uint32_T			oWIDTH_bytes= 	 nX*sizeof(uint32_T );
-	double				iMaps_bytes		= nY*nX*sizeof(uint8_T  );
-	double				oMap_bytes		= nY*nX*sizeof(uint32_T );
-	double				chMat_bytes		= nclasses*nclasses*nY*sizeof(uint32_T);
-	uint8_T  			*host_iMap1		= (uint8_T  *) CPLMalloc( iMaps_bytes );
-	uint8_T  			*host_iMap2		= (uint8_T  *) CPLMalloc( iMaps_bytes );
-	uint8_T  			*host_roiMap	= (uint8_T  *) CPLMalloc( iMaps_bytes );
-	uint32_T 			*host_oMap		= (uint32_T *) CPLMalloc( oMap_bytes  );
-	uint32_T 			*host_chMat		= (uint32_T *) CPLMalloc( chMat_bytes );
-
-/*	assert( cudaMallocHost( (void**)&host_iMap1, iMaps_bytes ) == 0 );
+	uint32_T			iMaps_bytes = nY*nX*sizeof(uint8_T  );
+	uint32_T			oMap_bytes  = nY*nX*sizeof(uint32_T );
+	uint32_T			chMat_bytes = nclasses*nclasses*nY*sizeof(uint32_T);
+/*	uint8_T  			*host_iMap1 = (uint8_T  *) CPLMalloc( iMaps_bytes );
+	uint8_T  			*host_iMap2 = (uint8_T  *) CPLMalloc( iMaps_bytes );
+	uint32_T 			*host_oMap 	= (uint32_T *) CPLMalloc( oMap_bytes  );
+	uint32_T 			*host_chMat = (uint32_T *) CPLMalloc( chMat_bytes );
+*/
+	assert( cudaMallocHost( (void**)&host_iMap1, iMaps_bytes ) == 0 );
 	assert( cudaMallocHost( (void**)&host_iMap2, iMaps_bytes ) == 0 );
 	assert( cudaMallocHost( (void**)&host_oMap,   oMap_bytes ) == 0 );
 	assert( cudaMallocHost( (void**)&host_chMat, chMat_bytes ) == 0 );
-*/
+
+	// read from HDD
+	GDALRasterIO( iBand1, GF_Read, 0, 0, nX, nY,
+				  host_iMap1, nX, nY, GDT_Byte, 0, 0 );
+	GDALRasterIO( iBand2, GF_Read, 0, 0, nX, nY,
+				  host_iMap2, nX, nY, GDT_Byte, 0, 0 );
 
 	//------------ gpu-devices ------------//
 	cudaGetDeviceCount(&devCount);
-	cudaGetDeviceProperties(&devProp, gpuSel);
-	printf("Texture alignment:\t\t%zu\t\t[el]\n", devProp.textureAlignment);
+	cudaGetDeviceProperties(&devProp, devCount-1);
+	printf("Texture alignment:\t\t%zu\n", devProp.textureAlignment);
 	printf("Concurrent copy and execute:\t%d\n", devProp.deviceOverlap);
-	double reqMem		= (iMaps_bytes*3 + oMap_bytes + chMat_bytes)/pow(1024,3);
-	double avGlobMem	= (double)devProp.totalGlobalMem/pow(1024,3);
-	printf("Global memory on GPU[%d]:\t%.2f\t\t[Gbytes]\n", gpuSel,avGlobMem );
-	printf("Required memory on GPU:\t\t%.2f\t\t[Gbytes]\n", reqMem);
-	printf("Available memory:\t\t%.2f\t\t[Gbytes]\n", avGlobMem-reqMem);
-
-	if(avGlobMem < 0) {
-		printf("Error: Available Global Memory on gpu %s #%d not sufficient!\n",devProp.name, gpuSel );
-		exit(EXIT_FAILURE);
-	}
-
-	// read from HDD
-	GDALRasterIO( iBand1,  GF_Read, 0, 0, nX, nY, host_iMap1,  nX, nY, GDT_Byte, 0, 0 );
-	GDALRasterIO( iBand2,  GF_Read, 0, 0, nX, nY, host_iMap2,  nX, nY, GDT_Byte, 0, 0 );
-	GDALRasterIO( roiBand, GF_Read, 0, 0, nX, nY, host_roiMap, nX, nY, GDT_Byte, 0, 0 );
 
 	//------------ KERNELS ------------//
-	cudaEventRecord( start, 0 );
 	//
 	//	-select GPU (a multi-gpu management is possible with "async" calls of memcopies and kernels):
 	cudaSetDevice(0);
 	//	-Allocate arrays on GPU device:
-	assert( cudaMalloc((void **)&dev_iMap1, iMaps_bytes) == 0 );
-	assert( cudaMalloc((void **)&dev_iMap2, iMaps_bytes) == 0 );
-	assert( cudaMalloc((void **)&dev_roiMap,iMaps_bytes) == 0 );
-	assert( cudaMalloc((void **)&dev_oMap,  oMap_bytes)  == 0 );
-	assert( cudaMalloc((void **)&dev_chMat, chMat_bytes) == 0 );
-	assert( cudaMemset(dev_chMat,0,(size_t) chMat_bytes) == 0 ); //IMPORTANT!!
+	assert( cudaMalloc((void **)&dev_iMap1,iMaps_bytes) == 0 );
+	assert( cudaMalloc((void **)&dev_iMap2,iMaps_bytes) == 0 );
+	assert( cudaMalloc((void **)&dev_oMap,  oMap_bytes) == 0 );
+	assert( cudaMalloc((void **)&dev_chMat,chMat_bytes) == 0 );
+	assert( cudaMemset(dev_chMat,0,(size_t)chMat_bytes) == 0 ); //IMPORTANT!!
 
 /*	//This allocates the 2D array of size nX*nY in device memory and returns pitch
  	assert( cudaMallocPitch( (void**)&dev_iMap1, &iPitch1, iWIDTH_bytes, nY) == 0 );
@@ -310,25 +322,31 @@ int main(int argc, char **argv)
 	assert( cudaMallocPitch( (void**)&dev_oMap,  &oPitch,  oWIDTH_bytes, nY) == 0 );
  	printf("iPitch1:\t%zu\niPitch2:\t%zu\noPitch:\t\t%zu\n",iPitch1,iPitch2,oPitch);
  */
-
+	int nStreams = 1, i=0,j=0;
+	//	-create stream:
+	cudaStream_t stream[nStreams];
+	for (i=1; i<=nStreams; i++) { assert( cudaStreamCreate(&stream[i]) == 0); }
+	for (i=1; i<=nStreams; i++) {
+		j = i-1;
+	//	-offset:
+		uint32_T offset  = (nX*nY) * j/nStreams;
+		uint32_T offset2 = nclasses*nclasses*nY * j/nStreams;
 	//	-copy: RAM--->GPU
-	assert( cudaMemcpy(dev_iMap1, host_iMap1, iMaps_bytes,cudaMemcpyHostToDevice) == 0 );
-	assert( cudaMemcpy(dev_iMap2, host_iMap2, iMaps_bytes,cudaMemcpyHostToDevice) == 0 );
-	assert( cudaMemcpy(dev_roiMap,host_roiMap,iMaps_bytes,cudaMemcpyHostToDevice) == 0 );
-/*	assert( cudaMemcpyAsync(dev_iMap1+offset, host_iMap1+offset, iMaps_bytes/nStreams, cudaMemcpyHostToDevice, stream[i]) == 0 );
-	assert( cudaMemcpyAsync(dev_iMap2+offset, host_iMap2+offset, iMaps_bytes/nStreams, cudaMemcpyHostToDevice, stream[i]) == 0 );
-*/
+//		assert( cudaMemcpy(dev_iMap1,host_iMap1,iMaps_bytes,cudaMemcpyHostToDevice) == 0 );
+//		assert( cudaMemcpy(dev_iMap2,host_iMap2,iMaps_bytes,cudaMemcpyHostToDevice) == 0 );
+		assert( cudaMemcpyAsync(dev_iMap1+offset, host_iMap1+offset, iMaps_bytes/nStreams, cudaMemcpyHostToDevice, stream[i]) == 0 );
+		assert( cudaMemcpyAsync(dev_iMap2+offset, host_iMap2+offset, iMaps_bytes/nStreams, cudaMemcpyHostToDevice, stream[i]) == 0 );
 /*	assert( cudaMemcpy2D(dev_iMap1,iPitch1,host_iMap1,(size_t) iWIDTH_bytes,(size_t) iWIDTH_bytes,(size_t) nY, cudaMemcpyHostToDevice) == 0 );
 	assert( cudaMemcpy2D(dev_iMap2,iPitch2,host_iMap2,(size_t) iWIDTH_bytes,(size_t) iWIDTH_bytes,(size_t) nY, cudaMemcpyHostToDevice) == 0 );
 */
 //	if(iPitch1 != iPitch2){ printf("Error: the pitch of the two input iMap's are different!\n"); return 1; }
 	//
 	// -kernel config:
-	BLOCKSIZE         	= floor(sqrt( devProp.maxThreadsPerBlock ));
-	GRIDSIZE			= 1 + (nY/(BLOCKSIZE*BLOCKSIZE));
-	dim3 block(BLOCKSIZE,BLOCKSIZE,1);
-	dim3 grid(GRIDSIZE,1,1);
-	uint32_T pitch 		= nX;//(uint32_T)iPitch1/sizeof(uint8_T);
+		BLOCKSIZE         	= floor(sqrt( devProp.maxThreadsPerBlock ));
+		GRIDSIZE			= 1 + (nY/(BLOCKSIZE*BLOCKSIZE))/nStreams;
+		dim3 block(BLOCKSIZE,BLOCKSIZE,1);
+		dim3 grid(GRIDSIZE,1,1);
+		uint32_T pitch = nX;//(uint32_T)iPitch1/sizeof(uint8_T);
 	/*	-kernel call 	[changemap]
 		const uint8_T *iMap1
 		const uint8_T *iMap2
@@ -340,43 +358,42 @@ int main(int argc, char **argv)
 		uint32_T *chMat
 		uint32_T *oMap
 	*/
-	changemap<<<grid,block>>>(	dev_iMap1,dev_iMap2, dev_roiMap,
-								nX,nY,pitch,nclasses,
-								dev_chMat,dev_oMap );
-	cudaDeviceSynchronize();
+		changemap<<<grid,block,0,stream[i]>>>(	dev_iMap1+offset,dev_iMap2+offset,
+									nX,nY/nStreams,pitch,nclasses,
+									dev_chMat+offset2,dev_oMap+offset );
+		assert( cudaMemcpyAsync(host_oMap+offset,dev_oMap+offset,oMap_bytes/nStreams,cudaMemcpyDeviceToHost, stream[i]) == 0 );
+	}
+//	cudaDeviceSynchronize();
 	//
 	// -kernel config:
+	BLOCKSIZE         	= floor(sqrt( devProp.maxThreadsPerBlock ));
+	GRIDSIZE			= 1 + (nY/(BLOCKSIZE*BLOCKSIZE));
+	dim3 block(BLOCKSIZE,BLOCKSIZE,1);
+	dim3 grid(GRIDSIZE,1,1);
 	/*	--call kernel 	[changemat]
 	 * 	(uint32_T *chMat, uint32_T chMat_dim, uint32_T ntiles)
 	 */
 	changemat<<<grid,block>>>( dev_chMat, nclasses*nclasses, nY );
 	cudaDeviceSynchronize();
-	//
-	// gather outputs:
-	//	-copy: GPU--->RAM
-	assert( cudaMemcpy(host_oMap,dev_oMap,oMap_bytes,cudaMemcpyDeviceToHost) == 0 );
-//	assert( cudaMemcpy2D(host_oMap,(size_t) oWIDTH_bytes,dev_oMap,oPitch,(size_t) oWIDTH_bytes,(size_t) nY, cudaMemcpyDeviceToHost) == 0 );
-	assert( cudaMemcpy(host_chMat,dev_chMat,chMat_bytes/nY,cudaMemcpyDeviceToHost) == 0 );
-	//
-	// CUDA timer:
-	cudaEventRecord( stop, 0 );
-	cudaEventSynchronize( stop );
-	cudaEventElapsedTime( &elapsed_time_ms, start, stop );
-	printf("Elapsed time {H2D,k1,k2,D2H}:\t%1.3f\t\t[s]\n\n",elapsed_time_ms/(float)1000.00);
 
 	//------------ OUTPUT changematrix ------------//
 	// ...to be completed
+	printf("to-be-saved:\n\t%s...\n",chFil);
+	assert( cudaMemcpy(host_chMat,dev_chMat,chMat_bytes/nY,cudaMemcpyDeviceToHost) == 0 );
 	FILE *fid ;
 	fid = fopen(chFil,"w");
 	if (fid == NULL) { printf("Error opening file %s!\n",chFil); exit(1); }
-	for(int i=0;i<nclasses;i++){
-		for(int j=0;j<nclasses;j++){
+	for(int i=1;i<nclasses;i++){
+		for(int j=1;j<nclasses;j++){
 			fprintf(fid, "%8d ", host_chMat[j+i*nclasses]);
 		}fprintf(fid,"\n");
 	} fclose(fid);
 
 	//------------ OUTPUT changemap ------------//
 	// CREATE DATASET on HDD
+	//	-copy: GPU--->RAM
+//	assert( cudaMemcpy(host_oMap,dev_oMap,oMap_bytes,cudaMemcpyDeviceToHost) == 0 );
+//	assert( cudaMemcpy2D(host_oMap,(size_t) oWIDTH_bytes,dev_oMap,oPitch,(size_t) oWIDTH_bytes,(size_t) nY, cudaMemcpyDeviceToHost) == 0 );
 	//	-options: tiling with block 512x512
 	papszOptions = CSLSetNameValue( papszOptions, "TILED", "YES");
 	papszOptions = CSLSetNameValue( papszOptions, "BLOCKXSIZE", "512");
@@ -398,24 +415,20 @@ int main(int argc, char **argv)
 	GDALClose( iMap2 );
 	GDALClose( oMap );
 	CSLDestroy( papszOptions );
-	VSIFree( host_iMap1 );
-	VSIFree( host_iMap2 );
-	VSIFree( host_oMap );
-	VSIFree( host_chMat );
+//	VSIFree( host_iMap1 );
+//	VSIFree( host_iMap2 );
 	// CUDA free:
 	cudaFree(dev_iMap1);
 	cudaFree(dev_iMap2);
 	cudaFree(dev_oMap);
 	cudaFree(dev_chMat);
 	// C free:
-/*	cudaFreeHost(host_iMap1);
+	cudaFreeHost(host_iMap1);
 	cudaFreeHost(host_iMap2);
 	cudaFreeHost(host_oMap);
 	cudaFreeHost(host_chMat);
-*/	// Destroy context
+	// Destroy context
 	assert( cudaDeviceReset() == cudaSuccess );
-
-	printf("\n\nFinished!!\n");
 
 	return 0;
 }
