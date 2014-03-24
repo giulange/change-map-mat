@@ -98,6 +98,7 @@ src/changemapmat.o : ../src/changemapmat.cu \
     /usr/include/inttypes.h \
     /usr/local/MATLAB/R2013a/extern/include/tmwtypes.h \
     /usr/lib/gcc/x86_64-linux-gnu/4.6/include/float.h \
+    /usr/lib/gcc/x86_64-linux-gnu/4.6/include/omp.h \
     /usr/include/gdal/gdal.h \
     /usr/include/gdal/gdal_version.h \
     /usr/include/gdal/cpl_port.h \

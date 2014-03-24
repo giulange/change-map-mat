@@ -47,7 +47,7 @@ all: change-map-mat secondary-outputs
 change-map-mat: $(OBJS) $(USER_OBJS)
 	@echo 'Building target: $@'
 	@echo 'Invoking: NVCC Linker'
-	nvcc -L/usr/lib -link -o  "change-map-mat" $(OBJS) $(USER_OBJS) $(LIBS)
+	nvcc -L/usr/lib -Xlinker -lgomp -link -o  "change-map-mat" $(OBJS) $(USER_OBJS) $(LIBS)
 	@echo 'Finished building target: $@'
 	@echo ' '
 

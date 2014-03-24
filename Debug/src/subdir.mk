@@ -17,8 +17,8 @@ OBJS += \
 src/%.o: ../src/%.cu
 	@echo 'Building file: $<'
 	@echo 'Invoking: NVCC Compiler'
-	nvcc -I/usr/include/gdal/ -G -g -O0 -gencode arch=compute_20,code=sm_20 -odir "src" -M -o "$(@:%.o=%.d)" "$<"
-	nvcc --compile -G -I/usr/include/gdal/ -O0 -g -gencode arch=compute_20,code=compute_20 -gencode arch=compute_20,code=sm_20  -x cu -o  "$@" "$<"
+	nvcc -I/usr/include/gdal/ -G -g -O0 -Xcompiler -fopenmp -gencode arch=compute_20,code=sm_20 -odir "src" -M -o "$(@:%.o=%.d)" "$<"
+	nvcc --compile -G -I/usr/include/gdal/ -O0 -Xcompiler -fopenmp -g -gencode arch=compute_20,code=compute_20 -gencode arch=compute_20,code=sm_20  -x cu -o  "$@" "$<"
 	@echo 'Finished building: $<'
 	@echo ' '
 

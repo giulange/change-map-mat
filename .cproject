@@ -32,6 +32,9 @@
 								<option id="nvcc.compiler.include.paths.320499974" name="Include paths (-I)" superClass="nvcc.compiler.include.paths" valueType="includePath">
 									<listOptionValue builtIn="false" value="/usr/include/gdal/"/>
 								</option>
+								<option id="nvcc.compiler.compileroptions.1567430611" superClass="nvcc.compiler.compileroptions" valueType="stringList">
+									<listOptionValue builtIn="false" value="-fopenmp"/>
+								</option>
 								<inputType id="nvcc.compiler.input.cu.1350902763" superClass="nvcc.compiler.input.cu"/>
 								<inputType id="nvcc.compiler.input.cpp.2105825723" superClass="nvcc.compiler.input.cpp"/>
 								<inputType id="nvcc.compiler.input.c.794847080" superClass="nvcc.compiler.input.c"/>
@@ -42,6 +45,9 @@
 								</option>
 								<option id="nvcc.linker.option.paths.1292960097" name="Library search path (-L)" superClass="nvcc.linker.option.paths" valueType="libPaths">
 									<listOptionValue builtIn="false" value="/usr/lib"/>
+								</option>
+								<option id="nvcc.linker.option.other.1703340417" superClass="nvcc.linker.option.other" valueType="stringList">
+									<listOptionValue builtIn="false" value="-lgomp"/>
 								</option>
 								<inputType id="nvcc.linker.input.994132769" superClass="nvcc.linker.input">
 									<additionalInput kind="additionalinputdependency" paths="$(USER_OBJS)"/>

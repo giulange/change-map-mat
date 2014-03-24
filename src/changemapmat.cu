@@ -6,6 +6,9 @@
 #include "/usr/local/MATLAB/R2013a/extern/include/tmwtypes.h"
 #include <assert.h>
 
+// OpenMP:
+#include <omp.h>
+
 // GDAL
 #include "gdal.h"
 #include "cpl_conv.h" 		/* for CPLMalloc() */
@@ -801,6 +804,560 @@ void run_kernels_multi_gpu_dev(	unsigned int nX, unsigned int nY, uint32_T nC,
 */
 }
 
+
+void run_kernels_multi_gpu_omp(	unsigned int nX, unsigned int nY, uint32_T nC,
+								GDALDatasetH iMap1, GDALDatasetH iMap2, GDALDatasetH roiMap,
+								const char *RefSyst, double *iGeoTransform, GDALDriverH hDriver ){
+
+	/*
+	 * 	DECLARATIONS
+	 */
+	GDALRasterBandH		iBand1,iBand2, roiBand;
+	float 				elapsed_time_ms = 0.0f;
+	unsigned int 		BLOCKSIZE, GRIDSIZE;
+	cudaDeviceProp		devProp;
+	int					devCount = 0;
+	uint8_T  			*host_iMap1, *host_iMap2, *host_roiMap;
+	uint32_T 			*host_oMap, *host_chMat;
+	uint8_T				*dev_iMap1, *dev_iMap2, *dev_roiMap;
+	uint32_T			*dev_oMap,  *dev_chMat;
+	uint32_T			i, j, nGPUs, nStreams, iS, nLaunches;
+	int 				gpu_id = -1;
+	uint32_T 			HEIGHT_CHUNK_i;
+	/*
+	 * 	GPU device
+	 */
+	// find out required memory:
+	double				iMaps_bytes		= nY*nX*sizeof( uint8_T  );
+	double				oMap_bytes		= nY*nX*sizeof( uint32_T );
+	double				chMat_bytes_host= nC*nC*sizeof( uint32_T );
+	double				reqMem			= (iMaps_bytes*3 + oMap_bytes + nY*chMat_bytes_host)/pow(1024,3);
+	double				resMem 			= reqMem;
+	// gpu count:
+	cudaGetDeviceCount(&devCount);
+	/*
+	 * 	to calculate the net time of using more GPUs I fix to one GPU:
+	 *	devCount = 1;
+	 */
+	// query GPU characteristics for all GPUs:
+	printf("Required memory:\t\t%.2f\t\t[Gbytes]\n", reqMem);
+	for(i=0;i<devCount;i++){
+		nGPUs = i+1;
+		cudaGetDeviceProperties(&devProp, i);
+		double avGlobMem	= (double)devProp.totalGlobalMem/pow(1024,3);
+		printf("Global memory on GPU[%d]:\t%.2f\t\t[Gbytes]\n", i,avGlobMem );
+		resMem = resMem-avGlobMem;
+		printf("Residual memory:\t\t%.2f\t\t[Gbytes]\n", resMem);
+		if(resMem<0){ break; }
+	}
+	/*
+	 * 	to force Italy on 2 GPUs and 3 Streams:
+	 * 	nStreams = 2+ 1; nGPUs = 2;
+	 */
+	nStreams = 2+ (int)reqMem / (int)(reqMem-resMem); // I must correct this line!
+	nLaunches = nGPUs * nStreams;
+	printf("Number of launches (%dxGPU):\t%d\n", nGPUs, nLaunches );
+	uint32_T 		CHUNK_LEN 			= (uint32_T) (nY / nLaunches);
+	omp_set_num_threads(nGPUs);
+
+	// allocate the Final changeMatrix:
+	uint32_T		*host_chMat_chunks	= (uint32_T *) CPLMalloc( chMat_bytes_host*nLaunches );
+	uint32_T 		*host_chMat_sum		= (uint32_T *) CPLMalloc( chMat_bytes_host );
+	for(int r=0;r<nC;r++) for(int c=0;c<nC;c++) host_chMat_sum[r+c*nC] = 0;
+
+	/*
+	 * 	GDAL I/O for iMaps:
+	 */
+	// get BANDS:
+	iBand1				= GDALGetRasterBand( iMap1,  GDALGetRasterCount( iMap1  ) ); // GDALGetRasterCount( iMap1 ) is equal to 1.
+	iBand2				= GDALGetRasterBand( iMap2,  GDALGetRasterCount( iMap2  ) );
+	roiBand				= GDALGetRasterBand( roiMap, GDALGetRasterCount( roiMap ) );
+	// Allocate page-locked (i.e. pinned) memory on RAM (host memory):
+	assert( cudaMallocHost( (void**)&host_iMap1, iMaps_bytes ) == 0 );
+	assert( cudaMallocHost( (void**)&host_iMap2, iMaps_bytes ) == 0 );
+	assert( cudaMallocHost( (void**)&host_roiMap,iMaps_bytes ) == 0 );
+	assert( cudaMallocHost( (void**)&host_oMap,   oMap_bytes ) == 0 );
+	// read data from HDD:
+	GDALRasterIO( iBand1,  GF_Read, 0, 0, nX, nY, host_iMap1,  nX, nY, GDT_Byte, 0, 0 );
+	GDALRasterIO( iBand2,  GF_Read, 0, 0, nX, nY, host_iMap2,  nX, nY, GDT_Byte, 0, 0 );
+	GDALRasterIO( roiBand, GF_Read, 0, 0, nX, nY, host_roiMap, nX, nY, GDT_Byte, 0, 0 );
+	/*
+	 * 	Create streams:
+	 */
+	//
+	cudaStream_t stream[nLaunches];
+	/*
+	 * 	Loop on synchronous streams (not asynchronous!!)
+	 */
+	for (j=0; j<nStreams; j++) {
+		/*
+		 * 	-multi-GPU implementation using CPU threads (one CPU thread per GPU):
+		 * 	[see http://geco.mines.edu/tesla/cuda_tutorial_mio/ ]
+		 */
+
+		uint32_T 			cpu_thread_id, num_cpu_threads;
+		uint32_T			offset_I, offset_O;
+
+		#pragma omp parallel
+		{
+			cpu_thread_id 	= omp_get_thread_num();
+			num_cpu_threads = omp_get_num_threads();
+			printf("Number of cpu threads:\t%d\n",num_cpu_threads);
+			//iS 				= gpu_id + j*nGPUs;
+			iS 				= cpu_thread_id + j*num_cpu_threads;
+			assert( cudaSetDevice(cpu_thread_id % num_cpu_threads) == 0 );
+			assert( cudaGetDevice(&gpu_id) == 0 );
+
+			cudaEvent_t 		start, stop, k1_s, k1_e, k2_s, k2_e;
+			assert( cudaEventCreate( &start )	 	== 0 );
+			assert( cudaEventCreate( &stop )  		== 0 );
+			assert( cudaEventCreate( &k1_s )	 	== 0 );
+			assert( cudaEventCreate( &k1_e )  		== 0 );
+			assert( cudaEventCreate( &k2_s )	 	== 0 );
+			assert( cudaEventCreate( &k2_e )  		== 0 );
+			assert( cudaEventRecord( start, 0 )		== 0 );
+			assert( cudaStreamCreate(&stream[iS])	== 0 );
+			printf("Stream[%d], cpu[%d], gpu[%d], Launch[%d]\n",j,cpu_thread_id,gpu_id,iS);
+			/*
+			 * 	Bytes allocation
+			 */
+			if(iS<nLaunches-1){	HEIGHT_CHUNK_i 	= CHUNK_LEN;}
+			else{				HEIGHT_CHUNK_i 	= nY - (CHUNK_LEN * (nLaunches-1));}
+			double				iMaps_by_chunk	= HEIGHT_CHUNK_i  * nX 		* sizeof(uint8_T);	// 2D
+			double				oMap_by_chunk	= HEIGHT_CHUNK_i  * nX 		* sizeof(uint32_T);	// 2D
+			double				chMat_by_chunk	= HEIGHT_CHUNK_i  * nC * nC * sizeof(uint32_T);	// 3D
+			printf("Size[%dx%d], Offset[%dx%d]\n",HEIGHT_CHUNK_i,nX,CHUNK_LEN*iS,0);
+			offset_I		= iS * iMaps_by_chunk;
+			offset_O		= iS * oMap_by_chunk;
+
+			//host_chMat		= (uint32_T *) CPLMalloc( chMat_by_chunk );
+			assert( cudaMallocHost( (void**)&host_chMat, chMat_by_chunk ) == 0 );
+			//	-Allocate arrays on GPU device:
+			assert( cudaMalloc((void **)&dev_iMap1, iMaps_by_chunk ) == 0 );
+			assert( cudaMalloc((void **)&dev_iMap2, iMaps_by_chunk ) == 0 );
+			assert( cudaMalloc((void **)&dev_roiMap,iMaps_by_chunk ) == 0 );
+			assert( cudaMalloc((void **)&dev_oMap,  oMap_by_chunk  ) == 0 );
+			assert( cudaMalloc((void **)&dev_chMat, chMat_by_chunk ) == 0 );
+			assert( cudaMemset(dev_chMat,0,(size_t) chMat_by_chunk ) == 0 ); //IMPORTANT!!
+		/*	//This allocates the 2D array of size nX*nY in device memory and returns pitch
+			assert( cudaMallocPitch( (void**)&dev_iMap1, &iPitch1, iWIDTH_bytes, nY) == 0 );
+			assert( cudaMallocPitch( (void**)&dev_iMap2, &iPitch2, iWIDTH_bytes, nY) == 0 );
+			assert( cudaMallocPitch( (void**)&dev_oMap,  &oPitch,  oWIDTH_bytes, nY) == 0 );
+			printf("iPitch1:\t%zu\niPitch2:\t%zu\noPitch:\t\t%zu\n",iPitch1,iPitch2,oPitch);
+		 */
+			//	-copy: RAM--->GPU
+			assert( cudaMemcpyAsync(dev_iMap1 , host_iMap1+offset_I,  iMaps_by_chunk, cudaMemcpyHostToDevice, stream[iS]) == 0 );
+			assert( cudaMemcpyAsync(dev_iMap2 , host_iMap2+offset_I,  iMaps_by_chunk, cudaMemcpyHostToDevice, stream[iS]) == 0 );
+			assert( cudaMemcpyAsync(dev_roiMap, host_roiMap+offset_I, iMaps_by_chunk, cudaMemcpyHostToDevice, stream[iS]) == 0 );
+		/*	assert( cudaMemcpy2D(dev_iMap1,iPitch1,host_iMap1,(size_t) iWIDTH_bytes,(size_t) iWIDTH_bytes,(size_t) nY, cudaMemcpyHostToDevice) == 0 );
+			assert( cudaMemcpy2D(dev_iMap2,iPitch2,host_iMap2,(size_t) iWIDTH_bytes,(size_t) iWIDTH_bytes,(size_t) nY, cudaMemcpyHostToDevice) == 0 );
+			if(iPitch1 != iPitch2){ printf("Error: the pitch of the two input iMap's are different!\n"); exit(EXIT_FAILURE); }
+		*/
+			/*
+			 * 	KERNELS LAUNCH
+			 */
+			// -kernel config:
+			BLOCKSIZE         	= floor(sqrt( devProp.maxThreadsPerBlock ));
+			GRIDSIZE			= 1 + ( HEIGHT_CHUNK_i/(BLOCKSIZE*BLOCKSIZE) );
+			dim3 block(BLOCKSIZE,BLOCKSIZE,1);
+			dim3 grid(GRIDSIZE,1,1);
+			uint32_T pitch 		= nX;//(uint32_T)iPitch1/sizeof(uint8_T);
+			// first kernel:
+			assert( cudaEventRecord( k1_s, 0 )		== 0 );
+			changemap<<<grid,block,0,stream[iS]>>>(	dev_iMap1,dev_iMap2, dev_roiMap,
+										nX,HEIGHT_CHUNK_i,pitch,nC,
+										dev_chMat,dev_oMap ); //cudaDeviceSynchronize();
+			assert( cudaEventRecord( k1_e, 0 )		== 0 );
+			assert( cudaMemcpyAsync(host_oMap+offset_O,dev_oMap,oMap_by_chunk,cudaMemcpyDeviceToHost, stream[iS]) == 0 );
+			//cudaDeviceSynchronize();
+			// second kernel:
+			assert( cudaEventRecord( k2_s, 0 )		== 0 );
+			changemat<<<grid,block,0,stream[iS]>>>( dev_chMat, nC*nC, HEIGHT_CHUNK_i ); //cudaDeviceSynchronize();
+			assert( cudaEventRecord( k2_e, 0 )		== 0 );
+			assert( cudaMemcpyAsync(host_chMat,dev_chMat,chMat_bytes_host,cudaMemcpyDeviceToHost, stream[iS]) == 0 );
+			cudaDeviceSynchronize();
+
+			/*
+			 * 	write CHUNK in oMap filename
+			 */
+/*			char Fname[255], pFormat[4];
+			sprintf(Fname,"/home/giuliano/git/cuda/change-map-mat/data/oMap_chunk_#%d",iS);
+			sprintf(pFormat,"%s","%5d ");
+			write_generic_array_on_HDD( host_oMap,  nX,  HEIGHT_CHUNK_i, Fname, pFormat );
+			sprintf(Fname,"/home/giuliano/git/cuda/change-map-mat/data/iMap1_chunk_#%d",iS);
+			write_uint8T_array_on_HDD( host_iMap1,  nX,  HEIGHT_CHUNK_i, Fname, pFormat );
+*/			/*
+			 * 	record chmat from current CHUNK
+			 */
+			for(int r=0;r<nC;r++) for(int c=0;c<nC;c++) host_chMat_chunks[r+c*nC+iS*nC*nC] = host_chMat[r+c*nC];
+/*			sprintf(Fname,"%s%d","/home/giuliano/git/cuda/change-map-mat/data/chMat_chunk_#",iS);
+			sprintf(pFormat,"%s","%9d ");
+			write_generic_array_on_HDD( host_chMat,  nC,  nC, Fname, pFormat );
+*/
+			// CUDA timer:
+			assert( cudaEventRecord( stop, 0 ) == 0 );
+			assert( cudaEventSynchronize( stop ) == 0 );
+			assert( cudaEventElapsedTime( &elapsed_time_ms, start, stop ) == 0 );
+			printf("Elapsed time=[%1.3fs]\n, ",elapsed_time_ms/(float)1000.00);
+			assert( cudaEventElapsedTime( &elapsed_time_ms, k1_s, k1_e ) == 0 );
+			printf("k1[changemap] time=[%1.3fs]\n, ",elapsed_time_ms/(float)1000.00);
+			assert( cudaEventElapsedTime( &elapsed_time_ms, k2_s, k2_e ) == 0 );
+			printf("k2[changemat] time=%1.3f [s]\n",elapsed_time_ms/(float)1000.00);
+
+			/*
+			 * 	FREE
+			 */
+			// CUDA Malloc free:
+			assert( cudaFreeHost( host_chMat ) 		== 0 );
+			assert( cudaFree(dev_iMap1 ) 			== 0 );
+			assert( cudaFree(dev_iMap2 ) 			== 0 );
+			assert( cudaFree(dev_roiMap) 			== 0 );
+			assert( cudaFree(dev_oMap  ) 			== 0 );
+			assert( cudaFree(dev_chMat ) 			== 0 );
+			// Destroy events:
+			assert( cudaEventDestroy( start )	 	== 0 );
+			assert( cudaEventDestroy( stop )  		== 0 );
+			assert( cudaEventDestroy( k1_s )	 	== 0 );
+			assert( cudaEventDestroy( k1_e )  		== 0 );
+			assert( cudaEventDestroy( k2_s )	 	== 0 );
+			assert( cudaEventDestroy( k2_e )  		== 0 );
+		}
+	}
+
+	/*
+	 * 	sum chmat from all CHUNKs
+	 */
+	for(iS=0;iS<nLaunches;iS++) for(int r=0;r<nC;r++) for(int c=0;c<nC;c++) host_chMat_sum[r+c*nC] += host_chMat_chunks[r+c*nC+iS*nC*nC];
+
+	/*
+	 *	write to HDD
+	 */
+	// 	-chMat:
+	save_chmat_on_HDD( nC, host_chMat_sum );
+	//	-oMap:
+	save_omap_on_HDD( RefSyst, iGeoTransform, hDriver, nX, nY, host_oMap);
+
+	/*
+	 * 	FREE
+	 */
+	// CUDA Malloc Host free:
+	assert( cudaFreeHost( host_iMap1 ) 		== 0 );
+	assert( cudaFreeHost( host_iMap2 ) 		== 0 );
+	assert( cudaFreeHost( host_roiMap) 		== 0 );
+	assert( cudaFreeHost( host_oMap  ) 		== 0 );
+	// C free:
+/*	cudaFreeHost(host_iMap1);
+	cudaFreeHost(host_iMap2);
+	cudaFreeHost(host_roiMap);
+	cudaFreeHost(host_oMap);
+	cudaFreeHost(host_chMat);
+*/	// GDAL free:
+	VSIFree( host_chMat_sum );
+}
+
+void run_kernels_multi_gpu_latest(	unsigned int nX, unsigned int nY, uint32_T nC,
+								GDALDatasetH iMap1, GDALDatasetH iMap2, GDALDatasetH roiMap,
+								const char *RefSyst, double *iGeoTransform, GDALDriverH hDriver ){
+
+	/*
+	 * 	DECLARATIONS
+	 */
+	GDALRasterBandH		iBand1,iBand2, roiBand;
+	unsigned int 		BLOCKSIZE, GRIDSIZE;
+	cudaDeviceProp		devProp;
+	int					devCount = 0;
+	uint8_T  			*host_iMap1, *host_iMap2, *host_roiMap;
+	uint32_T 			*host_oMap;
+	uint32_T			i, j, nGPUs, nStreams, iS, nLaunches;
+	int 				gpu_id = -1;
+	/*
+	 * 	GPU device
+	 */
+	// find out required memory:
+	double				iMaps_bytes		= nY*nX*sizeof( uint8_T  );
+	double				oMap_bytes		= nY*nX*sizeof( uint32_T );
+	double				chMat_bytes_host= nC*nC*sizeof( uint32_T );
+	double				reqMem			= (iMaps_bytes*3 + oMap_bytes + nY*chMat_bytes_host)/pow(1024,3);
+	double				resMem 			= reqMem;
+	// gpu count:
+	cudaGetDeviceCount(&devCount);
+	/*
+	 * 	to calculate the net time of using more GPUs I fix to one GPU:
+	 *	devCount = 1;
+	 */
+	// query GPU characteristics for all GPUs:
+	printf("Required memory:\t\t%.2f\t\t[Gbytes]\n", reqMem);
+	for(i=0;i<devCount;i++){
+		nGPUs = i+1;
+		cudaGetDeviceProperties(&devProp, i);
+		double avGlobMem	= (double)devProp.totalGlobalMem/pow(1024,3);
+		printf("Global memory on GPU[%d]:\t%.2f\t\t[Gbytes]\n", i,avGlobMem );
+		resMem = resMem-avGlobMem;
+		printf("Residual memory:\t\t%.2f\t\t[Gbytes]\n", resMem);
+		if(resMem<0){ break; }
+	}
+	/*
+	 * 	to force Italy on 2 GPUs and 3 Streams:
+	 * 	nStreams = 2+ 1; nGPUs = 2;
+	 */
+	nLaunches = 2+ (int)reqMem / (int)(reqMem-resMem); // I must correct this line!
+	nStreams = nGPUs;
+	printf("Number of launches (%dxGPU):\t%d\n", nGPUs, nLaunches*nStreams );
+	uint32_T 		CHUNK_LEN 			= (uint32_T) (nY / (nLaunches*nStreams));
+
+	uint32_T			*host_chMat[nGPUs];
+	uint8_T				*dev_iMap1[nGPUs], *dev_iMap2[nGPUs], *dev_roiMap[nGPUs];
+	uint32_T			*dev_oMap[nGPUs],  *dev_chMat[nGPUs];
+	uint32_T 			HEIGHT_CHUNK_i[nGPUs];
+	// allocate the Final changeMatrix:
+	uint32_T			*host_chMat_chunks[nGPUs];
+	uint32_T 			*host_chMat_sum;
+	double				iMaps_by_chunk[nGPUs];	// 2D
+	double				oMap_by_chunk[nGPUs];	// 2D
+	double				chMat_by_chunk[nGPUs];	// 3D
+	for(gpu_id=0;gpu_id<nGPUs;gpu_id++)
+	{
+		host_chMat_chunks[gpu_id]	= (uint32_T *) CPLMalloc( chMat_bytes_host*nLaunches*nStreams );
+	}
+	host_chMat_sum		= (uint32_T *) CPLMalloc( chMat_bytes_host );
+	for(gpu_id=0;gpu_id<nGPUs;gpu_id++) for(int r=0;r<nC;r++) for(int c=0;c<nC;c++) host_chMat_sum[r+c*nC] = 0;
+
+	/*
+	 * 	GDAL I/O for iMaps:
+	 */
+	// get BANDS:
+	iBand1				= GDALGetRasterBand( iMap1,  GDALGetRasterCount( iMap1  ) ); // GDALGetRasterCount( iMap1 ) is equal to 1.
+	iBand2				= GDALGetRasterBand( iMap2,  GDALGetRasterCount( iMap2  ) );
+	roiBand				= GDALGetRasterBand( roiMap, GDALGetRasterCount( roiMap ) );
+	// Allocate page-locked (i.e. pinned) memory on RAM (host memory):
+	assert( cudaMallocHost( (void**)&host_iMap1, iMaps_bytes ) == 0 );
+	assert( cudaMallocHost( (void**)&host_iMap2, iMaps_bytes ) == 0 );
+	assert( cudaMallocHost( (void**)&host_roiMap,iMaps_bytes ) == 0 );
+	assert( cudaMallocHost( (void**)&host_oMap,   oMap_bytes ) == 0 );
+	// read data from HDD:
+	GDALRasterIO( iBand1,  GF_Read, 0, 0, nX, nY, host_iMap1,  nX, nY, GDT_Byte, 0, 0 );
+	GDALRasterIO( iBand2,  GF_Read, 0, 0, nX, nY, host_iMap2,  nX, nY, GDT_Byte, 0, 0 );
+	GDALRasterIO( roiBand, GF_Read, 0, 0, nX, nY, host_roiMap, nX, nY, GDT_Byte, 0, 0 );
+	/*
+	 * 	Create streams:
+	 */
+	//
+	cudaStream_t stream[nGPUs], stream1[nGPUs], stream2[nGPUs], stream3[nGPUs];
+	cudaEvent_t  start[nGPUs], stop[nGPUs], k1_s[nGPUs], k1_e[nGPUs], k2_s[nGPUs], k2_e[nGPUs];
+	float 				elapsed_time_ms[nGPUs];
+	for(gpu_id=0;gpu_id<nGPUs;gpu_id++)
+	{
+		assert( cudaSetDevice(gpu_id) == 0 );
+		assert( cudaStreamCreate(&stream1[gpu_id])	== 0 );
+		assert( cudaStreamCreate(&stream2[gpu_id])	== 0 );
+		assert( cudaStreamCreate(&stream3[gpu_id])	== 0 );
+	}
+	/*
+	 * 	Loop on synchronous streams (not asynchronous!!)
+	 */
+	for (j=0; j<nLaunches; j++) {
+		/*
+		 * 	-multi-GPU implementation using CPU threads (one CPU thread per GPU):
+		 * 	[see http://geco.mines.edu/tesla/cuda_tutorial_mio/ ]
+		 */
+
+		uint32_T			offset_I, offset_O;
+
+		for(gpu_id=0;gpu_id<nGPUs;gpu_id++)
+		{
+			iS 				= gpu_id + j*nGPUs;
+			assert( cudaSetDevice(gpu_id) == 0 );
+
+			assert( cudaEventCreate( &start[gpu_id] )	 	== 0 );
+			assert( cudaEventCreate( &stop[gpu_id] )  		== 0 );
+			assert( cudaEventCreate( &k1_s[gpu_id] )	 	== 0 );
+			assert( cudaEventCreate( &k1_e[gpu_id] )  		== 0 );
+			assert( cudaEventCreate( &k2_s[gpu_id] )	 	== 0 );
+			assert( cudaEventCreate( &k2_e[gpu_id] )  		== 0 );
+			assert( cudaEventRecord( start[gpu_id], 0 )		== 0 );
+			assert( cudaStreamCreate(&stream[gpu_id])	== 0 );
+			printf("Stream[%d], cpu[%d], gpu[%d], Launch[%d]\n",j,gpu_id,gpu_id,iS);
+			/*
+			 * 	Bytes allocation
+			 */
+			if(iS<nLaunches*nGPUs-1){	HEIGHT_CHUNK_i[gpu_id] 	= CHUNK_LEN;}
+			else{				HEIGHT_CHUNK_i[gpu_id] 	= nY - (CHUNK_LEN * (nLaunches*nGPUs-1));}
+			iMaps_by_chunk[gpu_id]	= HEIGHT_CHUNK_i[gpu_id]  * nX 		* sizeof(uint8_T);	// 2D
+			oMap_by_chunk[gpu_id]	= HEIGHT_CHUNK_i[gpu_id]  * nX 		* sizeof(uint32_T);	// 2D
+			chMat_by_chunk[gpu_id]	= HEIGHT_CHUNK_i[gpu_id]  * nC * nC * sizeof(uint32_T);	// 3D
+			printf("Size[%dx%d], Offset[%dx%d]\n",HEIGHT_CHUNK_i[gpu_id],nX,CHUNK_LEN*iS,0);
+			offset_I		= iS * iMaps_by_chunk[gpu_id];
+			offset_O		= iS * oMap_by_chunk[gpu_id];
+
+			//host_chMat		= (uint32_T *) CPLMalloc( chMat_by_chunk );
+			assert( cudaMallocHost( (void**)&host_chMat[gpu_id], chMat_by_chunk[gpu_id] ) == 0 );
+			//	-Allocate arrays on GPU device:
+			assert( cudaMalloc((void **)&dev_iMap1[gpu_id], iMaps_by_chunk[gpu_id] ) == 0 );
+			assert( cudaMalloc((void **)&dev_iMap2[gpu_id], iMaps_by_chunk[gpu_id] ) == 0 );
+			assert( cudaMalloc((void **)&dev_roiMap[gpu_id],iMaps_by_chunk[gpu_id] ) == 0 );
+			assert( cudaMalloc((void **)&dev_oMap[gpu_id],  oMap_by_chunk[gpu_id]  ) == 0 );
+			assert( cudaMalloc((void **)&dev_chMat[gpu_id], chMat_by_chunk[gpu_id] ) == 0 );
+			assert( cudaMemset(dev_chMat[gpu_id],0,(size_t) chMat_by_chunk[gpu_id] ) == 0 ); //IMPORTANT!!
+		/*	//This allocates the 2D array of size nX*nY in device memory and returns pitch
+			assert( cudaMallocPitch( (void**)&dev_iMap1, &iPitch1, iWIDTH_bytes, nY) == 0 );
+			assert( cudaMallocPitch( (void**)&dev_iMap2, &iPitch2, iWIDTH_bytes, nY) == 0 );
+			assert( cudaMallocPitch( (void**)&dev_oMap,  &oPitch,  oWIDTH_bytes, nY) == 0 );
+			printf("iPitch1:\t%zu\niPitch2:\t%zu\noPitch:\t\t%zu\n",iPitch1,iPitch2,oPitch);
+		 */
+			//	-copy: RAM--->GPU
+			assert( cudaMemcpyAsync(dev_iMap1[gpu_id] , host_iMap1+offset_I,  iMaps_by_chunk[gpu_id], cudaMemcpyHostToDevice, stream1[gpu_id]) == 0 );
+			assert( cudaMemcpyAsync(dev_iMap2[gpu_id] , host_iMap2+offset_I,  iMaps_by_chunk[gpu_id], cudaMemcpyHostToDevice, stream2[gpu_id]) == 0 );
+			assert( cudaMemcpyAsync(dev_roiMap[gpu_id], host_roiMap+offset_I, iMaps_by_chunk[gpu_id], cudaMemcpyHostToDevice, stream3[gpu_id]) == 0 );
+		/*	assert( cudaMemcpy2D(dev_iMap1,iPitch1,host_iMap1,(size_t) iWIDTH_bytes,(size_t) iWIDTH_bytes,(size_t) nY, cudaMemcpyHostToDevice) == 0 );
+			assert( cudaMemcpy2D(dev_iMap2,iPitch2,host_iMap2,(size_t) iWIDTH_bytes,(size_t) iWIDTH_bytes,(size_t) nY, cudaMemcpyHostToDevice) == 0 );
+			if(iPitch1 != iPitch2){ printf("Error: the pitch of the two input iMap's are different!\n"); exit(EXIT_FAILURE); }
+		*/
+
+		}
+		for(gpu_id=0;gpu_id<nGPUs;gpu_id++)
+		{
+			assert( cudaSetDevice(gpu_id) == 0 );
+			assert( cudaStreamDestroy(stream1[gpu_id])	== 0 );
+			assert( cudaStreamDestroy(stream2[gpu_id])	== 0 );
+			assert( cudaStreamDestroy(stream3[gpu_id])	== 0 );
+		}
+		for(gpu_id=0;gpu_id<nGPUs;gpu_id++)
+		{
+			assert( cudaSetDevice(gpu_id) == 0 );
+			cudaDeviceSynchronize();
+		}
+#if 0
+		for(gpu_id=0;gpu_id<nGPUs;gpu_id++)
+		{
+			assert( cudaSetDevice(gpu_id) == 0 );
+			/*
+			 * 	KERNELS LAUNCH
+			 */
+			// -kernel config:
+			BLOCKSIZE         	= floor(sqrt( devProp.maxThreadsPerBlock ));
+			GRIDSIZE			= 1 + ( HEIGHT_CHUNK_i[gpu_id]/(BLOCKSIZE*BLOCKSIZE) );
+			dim3 block(BLOCKSIZE,BLOCKSIZE,1);
+			dim3 grid(GRIDSIZE,1,1);
+			uint32_T pitch 		= nX;//(uint32_T)iPitch1/sizeof(uint8_T);
+			// first kernel:
+			assert( cudaEventRecord( k1_s[gpu_id], 0 )		== 0 );
+			changemap<<<grid,block,0,stream[iS]>>>(	dev_iMap1[gpu_id],dev_iMap2[gpu_id], dev_roiMap[gpu_id],
+										nX,HEIGHT_CHUNK_i[gpu_id],pitch,nC,
+										dev_chMat[gpu_id],dev_oMap[gpu_id] ); //cudaDeviceSynchronize();
+			assert( cudaEventRecord( k1_e[gpu_id], 0 )		== 0 );
+		}
+		for(gpu_id=0;gpu_id<nGPUs;gpu_id++)
+		{
+			assert( cudaSetDevice(gpu_id) == 0 );
+			assert( cudaMemcpyAsync(host_oMap+offset_O,dev_oMap[gpu_id],oMap_by_chunk[gpu_id],cudaMemcpyDeviceToHost, stream[gpu_id]) == 0 );
+		}
+		for(gpu_id=0;gpu_id<nGPUs;gpu_id++)
+		{
+			assert( cudaSetDevice(gpu_id) == 0 );
+			// -kernel config:
+			BLOCKSIZE         	= floor(sqrt( devProp.maxThreadsPerBlock ));
+			GRIDSIZE			= 1 + ( HEIGHT_CHUNK_i[gpu_id]/(BLOCKSIZE*BLOCKSIZE) );
+			dim3 block(BLOCKSIZE,BLOCKSIZE,1);
+			dim3 grid(GRIDSIZE,1,1);
+			// second kernel:
+			assert( cudaEventRecord( k2_s[gpu_id], 0 )		== 0 );
+			changemat<<<grid,block,0,stream[gpu_id]>>>( dev_chMat[gpu_id], nC*nC, HEIGHT_CHUNK_i[gpu_id] );
+			assert( cudaEventRecord( k2_e[gpu_id], 0 )		== 0 );
+		}
+		for(gpu_id=0;gpu_id<nGPUs;gpu_id++)
+		{
+			assert( cudaSetDevice(gpu_id) == 0 );
+			assert( cudaMemcpyAsync(host_chMat[gpu_id],dev_chMat[gpu_id],chMat_bytes_host,cudaMemcpyDeviceToHost, stream[iS]) == 0 );
+		}
+#endif
+		for(gpu_id=0;gpu_id<nGPUs;gpu_id++)
+		{
+			assert( cudaSetDevice(gpu_id) == 0 );
+			/*
+			 * 	write CHUNK in oMap filename
+			 */
+/*			char Fname[255], pFormat[4];
+			sprintf(Fname,"/home/giuliano/git/cuda/change-map-mat/data/oMap_chunk_#%d",iS);
+			sprintf(pFormat,"%s","%5d ");
+			write_generic_array_on_HDD( host_oMap,  nX,  HEIGHT_CHUNK_i, Fname, pFormat );
+			sprintf(Fname,"/home/giuliano/git/cuda/change-map-mat/data/iMap1_chunk_#%d",iS);
+			write_uint8T_array_on_HDD( host_iMap1,  nX,  HEIGHT_CHUNK_i, Fname, pFormat );
+*/			/*
+			 * 	record chmat from current CHUNK
+			 */
+			for(int r=0;r<nC;r++) for(int c=0;c<nC;c++) host_chMat_chunks[gpu_id][r+c*nC+iS*nC*nC] = host_chMat[gpu_id][r+c*nC];
+/*			sprintf(Fname,"%s%d","/home/giuliano/git/cuda/change-map-mat/data/chMat_chunk_#",iS);
+			sprintf(pFormat,"%s","%9d ");
+			write_generic_array_on_HDD( host_chMat,  nC,  nC, Fname, pFormat );
+*/
+			// CUDA timer:
+			/*assert( cudaEventRecord( stop[gpu_id], 0 ) == 0 );
+			assert( cudaEventSynchronize( stop[gpu_id] ) == 0 );
+			assert( cudaEventElapsedTime( &elapsed_time_ms[gpu_id], start[gpu_id], stop[gpu_id] ) == 0 );
+			printf("Elapsed time=[%1.3fs]\n, ",elapsed_time_ms[gpu_id]/(float)1000.00);
+			assert( cudaEventElapsedTime( &elapsed_time_ms[gpu_id], k1_s[gpu_id], k1_e[gpu_id] ) == 0 );
+			printf("k1[changemap] time=[%1.3fs]\n, ",elapsed_time_ms[gpu_id]/(float)1000.00);
+			assert( cudaEventElapsedTime( &elapsed_time_ms[gpu_id], k2_s[gpu_id], k2_e[gpu_id] ) == 0 );
+			printf("k2[changemat] time=%1.3f [s]\n",elapsed_time_ms[gpu_id]/(float)1000.00);
+*/
+			/*
+			 * 	FREE
+			 */
+			// CUDA Malloc free:
+			assert( cudaFreeHost( host_chMat[gpu_id] ) 		== 0 );
+			assert( cudaFree(dev_iMap1[gpu_id] ) 			== 0 );
+			assert( cudaFree(dev_iMap2[gpu_id] ) 			== 0 );
+			assert( cudaFree(dev_roiMap[gpu_id]) 			== 0 );
+			assert( cudaFree(dev_oMap[gpu_id]  ) 			== 0 );
+			assert( cudaFree(dev_chMat[gpu_id] ) 			== 0 );
+			// Destroy events:
+			assert( cudaEventDestroy( start[gpu_id] )	 	== 0 );
+			assert( cudaEventDestroy( stop[gpu_id] )  		== 0 );
+			assert( cudaEventDestroy( k1_s[gpu_id] )	 	== 0 );
+			assert( cudaEventDestroy( k1_e[gpu_id] )  		== 0 );
+			assert( cudaEventDestroy( k2_s[gpu_id] )	 	== 0 );
+			assert( cudaEventDestroy( k2_e[gpu_id] )  		== 0 );
+
+			assert( cudaDeviceReset() == cudaSuccess );
+		}
+	}
+#if 0
+	/*
+	 * 	sum chmat from all CHUNKs
+	 */
+	for(iS=0;iS<nLaunches;iS++) for(int r=0;r<nC;r++) for(int c=0;c<nC;c++) host_chMat_sum[r+c*nC] += host_chMat_chunks[gpu_id][r+c*nC+iS*nC*nC];
+
+	/*
+	 *	write to HDD
+	 */
+	// 	-chMat:
+	save_chmat_on_HDD( nC, host_chMat_sum );
+	//	-oMap:
+	save_omap_on_HDD( RefSyst, iGeoTransform, hDriver, nX, nY, host_oMap);
+#endif
+	/*
+	 * 	FREE
+	 */
+	// CUDA Malloc Host free:
+	assert( cudaFreeHost( host_iMap1 ) 		== 0 );
+	assert( cudaFreeHost( host_iMap2 ) 		== 0 );
+	assert( cudaFreeHost( host_roiMap) 		== 0 );
+	assert( cudaFreeHost( host_oMap  ) 		== 0 );
+	// C free:
+/*	cudaFreeHost(host_iMap1);
+	cudaFreeHost(host_iMap2);
+	cudaFreeHost(host_roiMap);
+	cudaFreeHost(host_oMap);
+	cudaFreeHost(host_chMat);
+*/	// GDAL free:
+	VSIFree( host_chMat_sum );
+/*	for(gpu_id=0;gpu_id<nGPUs;gpu_id++)
+	{
+		assert( cudaSetDevice(gpu_id) == 0 );
+		assert( cudaDeviceReset() == cudaSuccess );
+	}*/
+}
+
 int main(int argc, char **argv)
 {
 	/*
@@ -916,7 +1473,9 @@ int main(int argc, char **argv)
 	}
 	else{
 		//run_kernels_multi_gpu( nX, nY, nclasses, iMap1, iMap2, roiMap, GDALGetProjectionRef( iMap1 ), iGeoTransform, hDriver );
-		run_kernels_multi_gpu_dev( nX, nY, nclasses, iMap1, iMap2, roiMap, GDALGetProjectionRef( iMap1 ), iGeoTransform, hDriver );
+		//run_kernels_multi_gpu_dev( nX, nY, nclasses, iMap1, iMap2, roiMap, GDALGetProjectionRef( iMap1 ), iGeoTransform, hDriver );
+		//run_kernels_multi_gpu_omp( nX, nY, nclasses, iMap1, iMap2, roiMap, GDALGetProjectionRef( iMap1 ), iGeoTransform, hDriver );
+		run_kernels_multi_gpu_latest( nX, nY, nclasses, iMap1, iMap2, roiMap, GDALGetProjectionRef( iMap1 ), iGeoTransform, hDriver );
 	}
 
 	//------------ KILL ------------//
@@ -924,7 +1483,7 @@ int main(int argc, char **argv)
 	GDALClose( iMap1 );
 	GDALClose( iMap2 );
 	// Destroy context
-	assert( cudaDeviceReset() == cudaSuccess );
+	//assert( cudaDeviceReset() == cudaSuccess );
 
 	printf("\n\nFinished!!\n");
 
